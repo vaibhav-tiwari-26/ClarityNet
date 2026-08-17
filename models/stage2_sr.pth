@@ -1,0 +1,5 @@
+Placeholder checkpoint for Stage 2 (ESPCNSR) - randomly initialized.
+
+Replace this file with trained weights (torch.save(model.state_dict(), "stage2_sr.pth")).
+run.py falls back to random init if this file is missing or unreadable, so the pipeline
+still runs end-to-end for I/O verification.
