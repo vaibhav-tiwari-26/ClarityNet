@@ -1,105 +1,134 @@
-"""ClarityNet entry script.
+"""
+ClarityNet — KLA Problem Statement: AI-Based Restoration of Degraded Images
+
+Entry point required by the submission spec.
 
 Usage:
     python run.py <input-dir> <output-dir>
 
-Two-stage restoration (Poisson-Gaussian denoising + 2x sub-pixel CNN
-super-resolution). Runs fully offline; uses CUDA when available and
-falls back to CPU automatically.
+Behavior:
+    - Reads every .npy file from <input-dir>.
+    - Creates <output-dir> if it does not already exist.
+    - Runs each input through the two-stage restoration pipeline
+      (Stage 1: Poisson-Gaussian denoiser, Stage 2: sub-pixel CNN SR).
+    - Writes one restored .npy file per input file, using the same
+      filename, into <output-dir>.
+    - Output arrays are grayscale, shape (H, W), float32, values
+      clipped to [0, 1], with no NaN/Inf values.
+    - Runs fully offline: no internet access, API keys, external
+      downloads, or manual configuration required. Uses GPU
+      automatically if available, otherwise falls back to CPU.
+
+NOTE ON MODEL WEIGHTS:
+    The checkpoints shipped in models/ (stage1_denoiser.pth,
+    stage2_sr.pth) are RANDOMLY INITIALIZED placeholders. They verify
+    that the full I/O pipeline (reading .npy, running both stages,
+    writing valid .npy outputs of the correct shape/range) is
+    spec-compliant end-to-end. They have not been trained yet, so
+    restoration quality is not representative of the final model.
+    Swap in trained weights at the same paths once training completes
+    — no other code changes are required.
 """
 
-import argparse
 import os
 import sys
+import glob
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from models.model_defs import build_stage1, build_stage2
+from models.model_defs import build_pipeline
+
+STAGE1_WEIGHTS = os.path.join(os.path.dirname(__file__), "models", "stage1_denoiser.pth")
+STAGE2_WEIGHTS = os.path.join(os.path.dirname(__file__), "models", "stage2_sr.pth")
+UPSCALE_FACTOR = 2
 
 
-def _to_grayscale(arr):
-    arr = np.asarray(arr)
-    if arr.ndim == 3 and arr.shape[-1] in (1, 3):
-        arr = arr[..., 0] if arr.shape[-1] == 1 else np.mean(arr[..., :3], axis=-1)
-    if arr.ndim != 2:
-        arr = np.squeeze(arr)
-    if arr.ndim != 2:
-        raise ValueError(f"Cannot reduce input of shape {arr.shape} to 2D grayscale")
+def load_pipeline(device):
+    denoiser, sr = build_pipeline(device=device, upscale_factor=UPSCALE_FACTOR)
+
+    denoiser.load_state_dict(torch.load(STAGE1_WEIGHTS, map_location=device))
+    sr.load_state_dict(torch.load(STAGE2_WEIGHTS, map_location=device))
+
+    denoiser.eval()
+    sr.eval()
+    return denoiser, sr
+
+
+def to_model_input(arr):
+    """
+    Normalize an arbitrary (H,W) or (H,W,1) input array into a
+    (1, 1, H, W) float32 tensor in [0, 1] for the network.
+    """
     arr = np.asarray(arr, dtype=np.float32)
-    if float(np.nanmax(arr)) > 1.0:
+
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    elif arr.ndim != 2:
+        raise ValueError(f"Expected (H,W) or (H,W,1) array, got shape {arr.shape}")
+
+    # Defensive normalization: if values look like they're in [0, 255],
+    # rescale to [0, 1]. Otherwise assume already in [0, 1].
+    if arr.max() > 1.0 + 1e-6:
         arr = arr / 255.0
-    return np.clip(arr, 0.0, 1.0)
+
+    arr = np.clip(arr, 0.0, 1.0)
+    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    return tensor
 
 
-def _clean(t):
-    t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
-    return torch.clamp(t, 0.0, 1.0)
-
-
-def _load(model, path, name):
-    if not os.path.isfile(path):
-        print(f"Warning: {name} weights not found ({path}); using random init")
-        return
-    try:
-        state = torch.load(path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        model.load_state_dict(state)
-        print(f"Loaded {name} weights from {path}")
-    except Exception as exc:
-        print(f"Warning: could not load {name} weights ({exc}); using random init")
-
-
-def restore(x_np, stage1, stage2, device):
-    img = _to_grayscale(x_np)
-    x = torch.from_numpy(img).view(1, 1, *img.shape).to(device)
+def restore_one(denoiser, sr, arr, device):
+    tensor = to_model_input(arr).to(device)
 
     with torch.no_grad():
-        denoised = _clean(stage1(x))
-        h, w = denoised.shape[-2:]
-        if h % 2 or w % 2:
-            denoised = F.pad(denoised, (0, w % 2, 0, h % 2))
-        up = _clean(stage2(denoised))
+        denoised = denoiser(tensor)
+        denoised = torch.clamp(denoised, 0.0, 1.0)
+        restored = sr(denoised)
+        restored = torch.clamp(restored, 0.0, 1.0)
 
-    return up.squeeze().cpu().numpy().astype(np.float32)
+    out = restored.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
+
+    # Final safety pass: no NaN/Inf, values strictly within [0, 1]
+    out = np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
+    out = np.clip(out, 0.0, 1.0)
+    return out
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ClarityNet image restoration")
-    parser.add_argument("input_dir", help="Directory containing .npy input images")
-    parser.add_argument("output_dir", help="Directory where restored .npy files are written")
-    args = parser.parse_args()
+    if len(sys.argv) != 3:
+        print("Usage: python run.py <input-dir> <output-dir>")
+        sys.exit(1)
 
-    if not os.path.isdir(args.input_dir):
-        sys.exit(f"Input directory does not exist: {args.input_dir}")
+    input_dir, output_dir = sys.argv[1], sys.argv[2]
+
+    if not os.path.isdir(input_dir):
+        print(f"Error: input directory not found: {input_dir}")
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    denoiser, sr = load_pipeline(device)
 
-    stage1 = build_stage1().to(device).eval()
-    stage2 = build_stage2().to(device).eval()
+    input_files = sorted(glob.glob(os.path.join(input_dir, "*.npy")))
+    if not input_files:
+        print(f"No .npy files found in {input_dir}")
+        sys.exit(0)
 
-    _load(stage1, os.path.join(models_dir, "stage1_denoiser.pth"), "Stage 1")
-    _load(stage2, os.path.join(models_dir, "stage2_sr.pth"), "Stage 2")
+    print(f"Found {len(input_files)} input file(s). Restoring...")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    for path in input_files:
+        filename = os.path.basename(path)
+        arr = np.load(path)
 
-    inputs = sorted(f for f in os.listdir(args.input_dir) if f.endswith(".npy"))
-    if not inputs:
-        sys.exit(f"No .npy files found in {args.input_dir}")
+        restored = restore_one(denoiser, sr, arr, device)
 
-    print(f"Found {len(inputs)} input file(s). Restoring...")
-    for name in inputs:
-        in_path = os.path.join(args.input_dir, name)
-        out_path = os.path.join(args.output_dir, name)
-        arr = np.load(in_path)
-        out = restore(arr, stage1, stage2, device)
-        np.save(out_path, out)
-        print(f"  {name}: {arr.shape} -> {out.shape}  saved to {out_path}")
+        out_path = os.path.join(output_dir, filename)
+        np.save(out_path, restored)
+        print(f"  {filename}: {arr.shape} -> {restored.shape}  saved to {out_path}")
+
     print("Done.")
 
 
